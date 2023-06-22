@@ -1,0 +1,153 @@
+---
+kind: pipeline
+name: default
+type: kubernetes
+
+platform:
+  os: linux
+  arch: amd64
+
+resources:
+  requests:
+    cpu: 1000
+    memory: 1024Mi
+
+environment:
+  OCI_REGISTRY: quay.io
+  OCI_IMAGE_REPO: ukhomeofficedigital/docker-kd
+  OCI_REPO_USERNAME: ukhomeofficedigital+docker_kd
+  KD_SHA512: 79eceb1fa5b9beac127103197065f1118da39640b0c3512ce2b15130e1829f0d1725d7dc1f44c95616140cbce912100678dc0325c732b79c02c2afda8bb99f41
+  KUBECTL_SHA512: 4eda22a29a1f24acfc0a664024224ebffa0c51a545342b64ef438922f97afe2cccb8f48bedc85d5362af6694cbd4d6708f4ab55a6db570d11c24aa5942128d19
+
+steps:
+- name: Increment Build Version
+  pull: Always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/acp-ci-tools
+  resources:
+    limits:
+      cpu: 100
+      memory: 256Mi
+  commands:
+  - git config --global --add safe.directory '*'
+  - ls -lrt
+  - git status
+  - echo "# current version - $(cat .semver)"
+  - awk -F. '/[0-9]+\./{$NF++;print}' OFS=. ORS= .semver | tee .semver-new >/dev/null
+  - rm -f .semver
+  - mv .semver-new .semver
+  - echo "# new build - $(cat .semver)"
+  - git commit -am"[CI SKIP] - Increment build version"
+  when:
+    event:
+      include:
+      - push
+      - pull_request
+      exclude:
+      - promote
+
+- name: build
+  pull: Always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  resources:
+    limits:
+      cpu: 1000
+      memory: 1024Mi
+  commands:
+  # wait for docker service to be up before running docker build
+  - /usr/local/bin/wait
+  - docker build --build-arg KD_VERSION=$$(cat .semver | cut -d "-" -f -1) --build-arg KUBECTL_VERSION=$$(cat .semver | cut -d "-" -f -1) --build-arg KD_SHA512=$${KD_SHA512} --build-arg KUBECTL_SHA512=$${KUBECTL_SHA512} -t "$${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:$$(cat .semver)" . --no-cache
+  - docker tag "$${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:$$(cat .semver)" "$${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:${DRONE_COMMIT_SHA}"
+  when:
+    event:
+      include:
+      - push
+      - pull_request
+      exclude:
+      - promote
+
+- name: Promote tag to Kubectl Version and Latest (Quay)
+  pull: Always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  resources:
+    limits:
+      cpu: 100
+      memory: 256Mi
+  commands:
+  # wait for docker service to be up before running docker build
+  - /usr/local/bin/wait
+  - docker login -u="$${OCI_REPO_USERNAME}" -p=$${OCI_REPO_TOKEN} $${OCI_REGISTRY}
+  - docker pull $${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:$$(cat .semver)
+  - docker tag $${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:$$(cat .semver) $${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:$$(cat .semver | cut -d "-" -f -1)
+  - docker tag $${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:$$(cat .semver) $${OCI_REGISTRY}/$${OCI_IMAGE_REPO}:latest
+  - docker push $${OCI_REGISTRY}/$${OCI_IMAGE_REPO} --all-tags
+  environment:
+    OCI_REPO_TOKEN:
+      from_secret: DOCKER_SECRET_2
+  when:
+    ref:
+    - refs/tags/**
+    event:
+    - promote
+
+- name: scan-image
+  pull: Always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/trivy/client:latest
+  resources:
+    limits:
+      cpu: 1000
+      memory: 1024Mi
+  environment:
+    IMAGE_NAME: quay.io/ukhomeofficedigital/docker-kd:${DRONE_COMMIT_SHA}
+    IGNORE_UNFIXED: "true"
+  when:
+    event:
+    - pull_request
+    - push
+
+- name: Push image tag to quay
+  pull: Always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  resources:
+    limits:
+      cpu: 100
+      memory: 256Mi
+  commands:
+  - docker login -u="$${OCI_REPO_USERNAME}" -p=$${OCI_REPO_TOKEN} $${OCI_REGISTRY}
+  - docker push $${OCI_REGISTRY}/$${OCI_IMAGE_REPO} --all-tags
+  environment:
+    OCI_REPO_TOKEN:
+      from_secret: DOCKER_SECRET_2
+  when:
+    branch:
+    - main
+    event:
+      include:
+      - push
+      exclude:
+      - promote
+
+- name: Push Semver and Tag Repo - force
+  pull: Always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/acp-ci-tools
+  resources:
+    limits:
+      cpu: 100
+      memory: 256Mi
+  commands:
+  - git branch --set-upstream-to origin/${DRONE_COMMIT_BRANCH} 
+  - git push --force
+  - git tag -a $(cat .semver) -m "[CI SKIP] - new tag - $(cat .semver)"
+  - git push --force origin $(cat .semver)
+  when:
+    branch:
+    - main
+    event:
+    - push
+
+services:
+- name: docker
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  resources:
+    limits:
+      cpu: 1000
+      memory: 1024Mi
